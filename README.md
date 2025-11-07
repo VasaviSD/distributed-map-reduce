@@ -12,7 +12,7 @@ A distributed MapReduce implementation for word counting using Docker containers
 ### 1. Clone/Download the Repository
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/VasaviSD/distributed-map-reduce
 cd map_reduce
 ```
 
