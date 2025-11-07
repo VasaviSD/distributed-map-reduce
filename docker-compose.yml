@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  coordinator:
+    build: .
+    container_name: coordinator
+    hostname: coordinator
+    command: python coordinator.py
+    environment:
+      - PYTHONUNBUFFERED=1
+      - COORDINATOR_PORT=18861
+      - DATASET_URL=${DATASET_URL:-http://mattmahoney.net/dc/enwik8.zip}
+      - N_MAP=${N_MAP:-32}
+      - N_REDUCE=${N_REDUCE:-8}
+    volumes:
+      - shared-data:/app/txt
+      - shared-splits:/app/input_splits
+    networks:
+      - mapreduce-network
+    ports:
+      - "18861:18861"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
+
+  worker:
+    build: .
+    command: python worker.py
+    environment:
+      - PYTHONUNBUFFERED=1
+      - COORDINATOR_HOST=coordinator
+      - COORDINATOR_PORT=18861
+    volumes:
+      - shared-data:/app/txt
+      - shared-splits:/app/input_splits
+    networks:
+      - mapreduce-network
+    depends_on:
+      - coordinator
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+volumes:
+  shared-data:
+  shared-splits:
+
+networks:
+  mapreduce-network:
+    driver: bridge
+
