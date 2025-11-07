@@ -60,6 +60,6 @@ Environment variables can be set when running docker-compose:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATASET_URL` | `http://mattmahoney.net/dc/enwik8.zip` | URL to download dataset |
+| `DATASET_URL` | `http://mattmahoney.net/dc/enwik9.zip` | URL to download dataset |
 | `N_MAP` | `6` | Number of map tasks |
 | `N_REDUCE` | `3` | Number of reduce regions |

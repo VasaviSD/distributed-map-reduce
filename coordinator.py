@@ -29,7 +29,6 @@ class CoordinatorService(rpyc.Service):
         self.reduce_tasks = []
         self.available_tasks = []
         self.task_lock = threading.Lock()
-        self.results_lock = threading.Lock()
         self.map_results = defaultdict(list)
         self.reduce_results = []
         self.task_counter = 0
@@ -58,7 +57,7 @@ class CoordinatorService(rpyc.Service):
             # Check for timed-out tasks
             for task in self.available_tasks:
                 if not task.completed and task.assigned_worker is not None:
-                    if time.time() - task.start_time > 20:  # 20 second timeout
+                    if time.time() - task.start_time > 60:  # 60 second timeout
                         print(f"Task {task.task_id} timed out on {task.assigned_worker}, reassigning to {worker_id}")
                         task.assigned_worker = worker_id
                         task.start_time = time.time()
@@ -66,7 +65,7 @@ class CoordinatorService(rpyc.Service):
             
             return None
     
-    def exposed_submit_map_result(self, worker_id, task_id, partitioned_data):
+    def exposed_submit_map_result(self, worker_id, task_id, file_locations):
         print(f"Received map result from {worker_id} for task {task_id}")
         
         with self.task_lock:
@@ -74,14 +73,12 @@ class CoordinatorService(rpyc.Service):
                 task = self.tasks[task_id]
                 if not task.completed:
                     task.completed = True
-                    task.result = partitioned_data
                     
-                    # Store partitioned results by region
-                    with self.results_lock:
-                        for region, pairs in partitioned_data.items():
-                            self.map_results[region].extend(pairs)
+                    # Store file locations by region
+                    for region, filepath in file_locations.items():
+                        self.map_results[region].append(filepath)
                     
-                    print(f"Map task {task_id} completed by {worker_id}")
+                    print(f"Map task {task_id} completed by {worker_id}, stored {len(file_locations)} file locations")
                     
                     # Check if all map tasks are done
                     if all(t.completed for t in self.map_tasks):
@@ -89,20 +86,19 @@ class CoordinatorService(rpyc.Service):
         
         return True
     
-    def exposed_submit_reduce_result(self, worker_id, task_id, results):
-        print(f"Received reduce result from {worker_id} for task {task_id}")
+    def exposed_submit_reduce_result(self, worker_id, task_id, output_file):
+        print(f"Received reduce result from {worker_id} for task {task_id} (output file location)")
         
         with self.task_lock:
             if task_id in self.tasks:
                 task = self.tasks[task_id]
                 if not task.completed:
                     task.completed = True
-                    task.result = results
                     
-                    with self.results_lock:
-                        self.reduce_results.extend(results)
+                    # Store output file location (NOT the data!)
+                    self.reduce_results.append(output_file)
                     
-                    print(f"Reduce task {task_id} completed by {worker_id}")
+                    print(f"Reduce task {task_id} completed by {worker_id}, stored output file location")
                     
                     # Check if all reduce tasks are done
                     if all(t.completed for t in self.reduce_tasks):
@@ -120,10 +116,12 @@ class CoordinatorService(rpyc.Service):
             task_id = self.task_counter
             self.task_counter += 1
             
-            # Get all intermediate data for this region
-            intermediate_data = self.map_results.get(region, [])
+            # Get all intermediate file locations for this region
+            intermediate_files = self.map_results.get(region, [])
             
-            task = Task(task_id, "reduce", (region, intermediate_data))
+            print(f"Reduce region {region}: {len(intermediate_files)} intermediate files")
+            
+            task = Task(task_id, "reduce", (region, intermediate_files))
             self.tasks[task_id] = task
             self.reduce_tasks.append(task)
             self.available_tasks.append(task)
@@ -218,7 +216,7 @@ def split_file(input_file, num_splits, output_dir="input_splits"):
 if __name__ == "__main__":
     
     # Configuration
-    dataset_url = os.environ.get('DATASET_URL', 'http://mattmahoney.net/dc/enwik8.zip')
+    dataset_url = os.environ.get('DATASET_URL', 'http://mattmahoney.net/dc/enwik9.zip')
     n_reduce = int(os.environ.get('N_REDUCE', '3'))
     n_map = int(os.environ.get('N_MAP', '6'))
     port = int(os.environ.get('COORDINATOR_PORT', '18861'))
@@ -256,13 +254,22 @@ if __name__ == "__main__":
     print(f"Coordinator server started on port {port}")
     
     # Wait for all tasks to complete
-    results = coordinator_service.wait_for_completion()
+    output_files = coordinator_service.wait_for_completion()
     
-    # Aggregate and display results
-    print("Aggregating final results...")
+    # Aggregate and display results by reading from output files
+    print("Aggregating final results from output files...")
     word_counts = Counter()
-    for word, count in results:
-        word_counts[word] += count
+    for output_file in output_files:
+        print(f"Reading results from {output_file}")
+        with open(output_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split('\t')
+                if len(parts) == 2:
+                    word, count = parts[0], int(parts[1])
+                    word_counts[word] += count
     
     # Display top 20 most frequent words
     print('\nTOP 20 WORDS BY FREQUENCY\n')

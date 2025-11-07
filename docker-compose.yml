@@ -9,12 +9,14 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - COORDINATOR_PORT=18861
-      - DATASET_URL=${DATASET_URL:-http://mattmahoney.net/dc/enwik8.zip}
+      - DATASET_URL=${DATASET_URL:-http://mattmahoney.net/dc/enwik9.zip}
       - N_MAP=${N_MAP:-32}
-      - N_REDUCE=${N_REDUCE:-8}
+      - N_REDUCE=${N_REDUCE:-32}
     volumes:
       - shared-data:/app/txt
       - shared-splits:/app/input_splits
+      - shared-intermediate:/app/intermediate
+      - shared-output:/app/output
     networks:
       - mapreduce-network
     ports:
@@ -36,6 +38,8 @@ services:
     volumes:
       - shared-data:/app/txt
       - shared-splits:/app/input_splits
+      - shared-intermediate:/app/intermediate
+      - shared-output:/app/output
     networks:
       - mapreduce-network
     depends_on:
@@ -50,6 +54,8 @@ services:
 volumes:
   shared-data:
   shared-splits:
+  shared-intermediate:
+  shared-output:
 
 networks:
   mapreduce-network:
