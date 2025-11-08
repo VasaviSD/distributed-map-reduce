@@ -1,151 +1,244 @@
 import rpyc
-from rpyc.utils.server import ThreadedServer
-import threading
+from rpyc.utils.classic import obtain
 import time
 import os
-import sys
 import requests
 import zipfile
 import subprocess
 from collections import Counter, defaultdict
-
+from concurrent.futures import ThreadPoolExecutor
 
 class Task:
-    def __init__(self, task_id, task_type, input_data):
+    def __init__(self, task_id, input_data):
         self.task_id = task_id
-        self.task_type = task_type
         self.input_data = input_data
         self.assigned_worker = None
         self.start_time = None
         self.completed = False
         self.result = None
 
+class Worker:
+    def __init__(self, worker_id, conn):
+        self.worker_id = worker_id
+        self.conn = conn
+        self.busy = False
+        self.future = None
+
 
 class CoordinatorService(rpyc.Service):
-    def __init__(self):
+    def __init__(self, n_map, n_reduce):
         super().__init__()
-        self.tasks = {}
-        self.map_tasks = []
-        self.reduce_tasks = []
-        self.available_tasks = []
-        self.task_lock = threading.Lock()
+        self.map_tasks = {}
+        self.reduce_tasks = {}
         self.map_results = defaultdict(list)
         self.reduce_results = []
-        self.task_counter = 0
-        self.n_reduce = 0
-        self.map_phase_complete = False
-        self.all_complete = False
-        
-    def exposed_register_worker(self, worker_id):
-        print(f"Worker {worker_id} registered")
-        return True
-    
-    def exposed_request_task(self, worker_id):
-        with self.task_lock:
-            # Check if all tasks are complete
-            if self.all_complete:
-                return None
-            
-            # Find an available task
-            for task in self.available_tasks[:]:
-                if not task.completed and task.assigned_worker is None:
-                    task.assigned_worker = worker_id
-                    task.start_time = time.time()
-                    print(f"Assigned {task.task_type} task {task.task_id} to {worker_id}")
-                    return (task.task_id, task.task_type, task.input_data)
-            
-            # Check for timed-out tasks
-            for task in self.available_tasks:
-                if not task.completed and task.assigned_worker is not None:
-                    if time.time() - task.start_time > 60:  # 60 second timeout
-                        print(f"Task {task.task_id} timed out on {task.assigned_worker}, reassigning to {worker_id}")
-                        task.assigned_worker = worker_id
-                        task.start_time = time.time()
-                        return (task.task_id, task.task_type, task.input_data)
-            
-            return None
-    
-    def exposed_submit_map_result(self, worker_id, task_id, file_locations):
-        print(f"Received map result from {worker_id} for task {task_id}")
-        
-        with self.task_lock:
-            if task_id in self.tasks:
-                task = self.tasks[task_id]
-                if not task.completed:
-                    task.completed = True
-                    
-                    # Store file locations by region
-                    for region, filepath in file_locations.items():
-                        self.map_results[region].append(filepath)
-                    
-                    print(f"Map task {task_id} completed by {worker_id}, stored {len(file_locations)} file locations")
-                    
-                    # Check if all map tasks are done
-                    if all(t.completed for t in self.map_tasks):
-                        self._start_reduce_phase()
-        
-        return True
-    
-    def exposed_submit_reduce_result(self, worker_id, task_id, output_file):
-        print(f"Received reduce result from {worker_id} for task {task_id} (output file location)")
-        
-        with self.task_lock:
-            if task_id in self.tasks:
-                task = self.tasks[task_id]
-                if not task.completed:
-                    task.completed = True
-                    
-                    # Store output file location (NOT the data!)
-                    self.reduce_results.append(output_file)
-                    
-                    print(f"Reduce task {task_id} completed by {worker_id}, stored output file location")
-                    
-                    # Check if all reduce tasks are done
-                    if all(t.completed for t in self.reduce_tasks):
-                        self.all_complete = True
-                        print("All tasks completed!")
-        
-        return True
-    
-    def _start_reduce_phase(self):
-        print("Starting reduce phase...")
-        self.map_phase_complete = True
-        
-        # Create reduce tasks for each region
-        for region in range(self.n_reduce):
-            task_id = self.task_counter
-            self.task_counter += 1
-            
-            # Get all intermediate file locations for this region
-            intermediate_files = self.map_results.get(region, [])
-            
-            print(f"Reduce region {region}: {len(intermediate_files)} intermediate files")
-            
-            task = Task(task_id, "reduce", (region, intermediate_files))
-            self.tasks[task_id] = task
-            self.reduce_tasks.append(task)
-            self.available_tasks.append(task)
-        
-        print(f"Created {len(self.reduce_tasks)} reduce tasks")
-    
-    def initialize_map_tasks(self, text_files, n_reduce):
+        self.n_map = n_map
         self.n_reduce = n_reduce
+        self.workers = {}
         
-        for i, filepath in enumerate(text_files):
-            task_id = self.task_counter
-            self.task_counter += 1
+    def connect_to_workers(self, worker_port):
+        print("Connecting to workers...")
+        
+        i = 1
+        while True:
+            worker_host = f"map_reduce-worker-{i}"
+            try:
+                print(f"Trying to connect to {worker_host}:{worker_port}...")
+                conn = rpyc.connect(
+                    worker_host,
+                    worker_port,
+                    config={
+                        'allow_public_attrs': True,
+                        'allow_pickle': True,
+                        'sync_request_timeout': 300
+                    }
+                )
+                worker = Worker(worker_host, conn)
+
+                self.workers[worker_host] = worker
+                print(f"Connected to {worker_host}")
+                i += 1
+            except Exception as e:
+                print(f"Could not connect to {worker_host}: {e}")
+                break
+        
+        print(f"Connected to {len(self.workers)} workers")
+        return self.workers
+    
+
+    def close_workers(self):
+        print("Attempting to close workers....")
+        
+        for i in range(1, len(self.workers) + 1):
+            worker_host = f"map_reduce-worker-{i}"
+            print(f"Trying to close {worker_host}...")
+            try:
+                self.workers[worker_host].conn.root.exposed_close()
+            except Exception as e:
+                continue
+    
+    def is_phase_complete(self, phase):
+        if phase == "map":
+            tasks = self.map_tasks
+        else:
+            tasks = self.reduce_tasks
+        
+        for task in tasks:
+            if not tasks[task].completed:
+                return False
+        return True
+
+    def get_available_tasks(self, phase):
+        tasks = []
+        if phase == "map":
+            for task in self.map_tasks:
+                if not self.map_tasks[task].assigned_worker and not self.map_tasks[task].completed:
+                    tasks.append(task)
+        elif phase == "reduce":
+            for task in self.reduce_tasks:
+                if not self.reduce_tasks[task].assigned_worker and not self.reduce_tasks[task].completed:
+                    tasks.append(task)
+        
+        return tasks
+    
+    def assign_task(self, task_id, worker_id, phase):
+        if phase == "map":
+            self.map_tasks[task_id].assigned_worker = worker_id
+            self.map_tasks[task_id].start_time = time.time()
+        elif phase == "reduce":
+            self.reduce_tasks[task_id].assigned_worker = worker_id
+            self.reduce_tasks[task_id].start_time = time.time()
+        self.workers[worker_id].busy = True
+
+    def get_free_worker(self):
+        for worker_id in self.workers:
+            if not self.workers[worker_id].busy and not self.workers[worker_id].conn.closed:
+                return worker_id
+
+    def is_future_success(self, future):
+        return future.done() and not future.cancelled() and future.exception() is None
+    
+    def capture_results(self, phase):
+        if phase == "map":
+            tasks = self.map_tasks
+        else:
+            tasks = self.reduce_tasks
+
+        for task_id in tasks:
+            if tasks[task_id].assigned_worker is not None:
+                worker_id = tasks[task_id].assigned_worker
+                if time.time() - tasks[task_id].start_time > 20:  # 20 second timeout
+                    print(f"Task {task_id} timed out on {tasks[task_id].assigned_worker}")
+                    tasks[task_id].assigned_worker = None
+                    self.workers[worker_id].busy = False
+                    self.workers[worker_id].future = None
+                    continue
+
+                future = self.workers[worker_id].future
+
+                if future and self.is_future_success(future):
+                    if phase == "map":
+                        result = obtain(future.result())
+                        print(f"Received map result from {worker_id} for task {task_id}")
+                            
+                        # Store file locations by region
+                        for region, filepath in result.items():
+                            self.map_results[region].append(filepath)
+                        
+                        print(f"Map task {task_id} completed by {worker_id}, stored {len(result)} file locations")
+                    else:
+                        result = obtain(future.result())
+
+                        print(f"Received reduce result from {worker_id} for task {task_id}")
+                            
+                        self.reduce_results.append(result)
+                        
+                        print(f"Reduce task {task_id} completed by {worker_id}, stored {len(result)} file locations")
+
+                    tasks[task_id].completed = True
+                    self.workers[worker_id].busy = False
+                    self.workers[worker_id].future = None
+                    tasks[task_id].assigned_worker = None
+
+    
+    def run_map_phase(self):
+        print(f"Starting map phase with: {len(self.map_tasks)} tasks, {len(self.workers)} workers")
+        
+        executor = ThreadPoolExecutor(max_workers=len(self.workers))
+
+        while not self.is_phase_complete("map"):
+            for task_id in self.get_available_tasks("map"):
+                if task_id is None:
+                    continue
+
+                worker_id = self.get_free_worker()
+
+                if worker_id is None:
+                    continue
+
+                filepath = self.map_tasks[task_id].input_data
+                print(f"Assigning map task {task_id} to {worker_id}: {filepath}")
+                self.assign_task(task_id, worker_id, "map")
+
+                future = executor.submit(
+                        self.workers[worker_id].conn.root.exposed_map,
+                        task_id,
+                        filepath,
+                        self.n_reduce
+                    )
+                self.workers[worker_id].future = future
             
-            task = Task(task_id, "map", (filepath, n_reduce))
-            self.tasks[task_id] = task
-            self.map_tasks.append(task)
-            self.available_tasks.append(task)
+            self.capture_results("map")
+        
+        print(f"Map phase complete: {len(self.map_results)} regions")
+    
+    def run_reduce_phase(self):
+        print(f"Starting reduce phase with: {self.n_reduce} tasks, {len(self.workers)} workers")
+        
+        executor = ThreadPoolExecutor(max_workers=len(self.workers))
+
+        while not self.is_phase_complete("reduce"):
+            for task_id in self.get_available_tasks("reduce"):
+                if task_id is None:
+                    continue
+
+                worker_id = self.get_free_worker()
+
+                if worker_id is None:
+                    continue
+
+                files = self.reduce_tasks[task_id].input_data
+                print(f"Assigning reduce task {task_id} to {worker_id}: {len(files)} files")
+                self.assign_task(task_id, worker_id, "reduce")
+
+                future = executor.submit(
+                        self.workers[worker_id].conn.root.exposed_reduce,
+                        task_id,
+                        task_id,
+                        files
+                    )
+                self.workers[worker_id].future = future
+            
+            self.capture_results("reduce")
+        
+        print(f"Reduce phase complete: {len(self.map_results)} regions")
+    
+    
+    def initialize_reduce_tasks(self):
+        for i in range(self.n_reduce):
+            task = Task(i, self.map_results[i])
+            self.reduce_tasks[i] = task
+        
+        print(f"Created {len(self.reduce_tasks)} reduce tasks from {self.n_reduce} regions")
+    
+    def initialize_map_tasks(self, text_files):
+        for i, filepath in enumerate(text_files):
+            task = Task(i, filepath)
+            self.map_tasks[i] = task
         
         print(f"Created {len(self.map_tasks)} map tasks from {len(text_files)} files")
     
-    def wait_for_completion(self):
-        while not self.all_complete:
-            time.sleep(1)
-        
+    def get_final_results(self):
         return self.reduce_results
 
 
@@ -215,16 +308,14 @@ def split_file(input_file, num_splits, output_dir="input_splits"):
 
 if __name__ == "__main__":
     
-    # Configuration
     dataset_url = os.environ.get('DATASET_URL', 'http://mattmahoney.net/dc/enwik9.zip')
     n_reduce = int(os.environ.get('N_REDUCE', '3'))
     n_map = int(os.environ.get('N_MAP', '6'))
-    port = int(os.environ.get('COORDINATOR_PORT', '18861'))
+    worker_port = int(os.environ.get('WORKER_PORT', '18861'))
     
-    print(f"Starting Coordinator on port {port}")
     print(f"Dataset URL: {dataset_url}")
     print(f"Number of map tasks: {n_map}")
-    print(f"Number of reduce workers: {n_reduce}")
+    print(f"Number of reduce tasks: {n_reduce}")
     
     # Download and prepare dataset
     dataset_file = download_dataset(dataset_url)
@@ -234,27 +325,15 @@ if __name__ == "__main__":
 
     start_time = time.time()
     
-    # Create coordinator service
-    coordinator_service = CoordinatorService()
-    coordinator_service.initialize_map_tasks(split_files, n_reduce)
+    coordinator_service = CoordinatorService(n_map, n_reduce)
+    coordinator_service.initialize_map_tasks(split_files)
+    coordinator_service.connect_to_workers(worker_port)
+
+    coordinator_service.run_map_phase()
+    coordinator_service.initialize_reduce_tasks()
+    coordinator_service.run_reduce_phase()
     
-    # Start RPyC server in a separate thread
-    server = ThreadedServer(
-        coordinator_service,
-        port=port,
-        protocol_config={
-            'allow_public_attrs': True,
-            'allow_pickle': True,
-            'sync_request_timeout': 300
-        }
-    )
-    
-    server_thread = threading.Thread(target=server.start, daemon=True)
-    server_thread.start()
-    print(f"Coordinator server started on port {port}")
-    
-    # Wait for all tasks to complete
-    output_files = coordinator_service.wait_for_completion()
+    output_files = coordinator_service.get_final_results()
     
     # Aggregate and display results by reading from output files
     print("Aggregating final results from output files...")
@@ -286,7 +365,5 @@ if __name__ == "__main__":
     elapsed_time = end_time - start_time
     
     print("Elapsed Time: {} seconds".format(elapsed_time))
-    
-    # Shutdown server
-    server.close()
-    print("Coordinator shutting down")
+
+    coordinator_service.close_workers()

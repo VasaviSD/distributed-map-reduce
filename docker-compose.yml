@@ -8,7 +8,8 @@ services:
     command: python coordinator.py
     environment:
       - PYTHONUNBUFFERED=1
-      - COORDINATOR_PORT=18861
+      - WORKER_PORT=18861
+      - WORKER_HOST=worker
       - DATASET_URL=${DATASET_URL:-http://mattmahoney.net/dc/enwik9.zip}
       - N_MAP=${N_MAP:-32}
       - N_REDUCE=${N_REDUCE:-32}
@@ -24,17 +25,16 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
-        reservations:
           memory: 1G
+        reservations:
+          memory: 512M
 
   worker:
     build: .
     command: python worker.py
     environment:
       - PYTHONUNBUFFERED=1
-      - COORDINATOR_HOST=coordinator
-      - COORDINATOR_PORT=18861
+      - WORKER_PORT=18861
     volumes:
       - shared-data:/app/txt
       - shared-splits:/app/input_splits
@@ -60,4 +60,3 @@ volumes:
 networks:
   mapreduce-network:
     driver: bridge
-
