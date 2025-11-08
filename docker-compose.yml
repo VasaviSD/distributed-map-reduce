@@ -1,4 +1,5 @@
 version: '3.8'
+name: distributed-map-reduce
 
 services:
   coordinator:

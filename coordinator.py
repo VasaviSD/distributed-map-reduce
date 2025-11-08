@@ -41,7 +41,7 @@ class CoordinatorService(rpyc.Service):
         
         i = 1
         while True:
-            worker_host = f"map_reduce-worker-{i}"
+            worker_host = f"distributed-map-reduce-worker-{i}"
             try:
                 print(f"Trying to connect to {worker_host}:{worker_port}...")
                 conn = rpyc.connect(
@@ -70,7 +70,7 @@ class CoordinatorService(rpyc.Service):
         print("Attempting to close workers....")
         
         for i in range(1, len(self.workers) + 1):
-            worker_host = f"map_reduce-worker-{i}"
+            worker_host = f"distributed-map-reduce-worker-{i}"
             print(f"Trying to close {worker_host}...")
             try:
                 self.workers[worker_host].conn.root.exposed_close()
